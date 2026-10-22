@@ -1854,6 +1854,32 @@ describe('MarketSection (jsdom)', () => {
     expect(screen.queryByRole('button', { name: en.update })).toBeNull()
   })
 
+  it('marks a hold the registry could not timestamp as estimated (#961)', async () => {
+    // Mid-sync the mirror answers /latest but not the packument entry; the
+    // market holds anyway and says it is a guess, rather than claiming a
+    // window it cannot know.
+    const until = new Date(Date.now() + 25 * 60_000).toISOString()
+    stubFetch({
+      '/dsh-market/installed': { profile: 'web', installed: { 'dsh-loop': '^1.0.0' }, live: [] },
+      '/dsh-market/updates': {
+        updates: {
+          'dsh-loop': {
+            kind: 'npm', version: '1.0.0', current: '1.0.0', latest: '1.2.0',
+            updateAvailable: false, heldUpdate: { latest: '1.2.0', until, estimated: true },
+          },
+        },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+
+    const tag = await screen.findByText(en.updateHeldTag)
+    expect(tag.getAttribute('title')).toMatch(/mirror|镜像/)
+    expect(tag.getAttribute('title')).toMatch(/minute|分钟/)
+    expect(screen.queryByRole('button', { name: en.update })).toBeNull()
+  })
+
   it('names a newer prerelease instead of "up to date", and installs that exact version (#867)', async () => {
     // The pinned install is AHEAD of npm's `latest` (0.2.1-alpha.2 vs
     // 0.1.5-alpha.2), which means the reader follows a line `latest` does not
@@ -8488,5 +8514,152 @@ describe('sidebar shortcut tip (#846)', () => {
     fireEvent.click(await screen.findByRole('button', { name: en.sidebarTipDismiss }))
     expect(localStorage.getItem('dshm-sidebar-tip-dismissed')).toBe('1')
     expect(screen.queryByText(en.sidebarTip)).toBeNull()
+  })
+})
+
+describe('最近收录 collapses and hides without losing its column measurement (#940)', () => {
+  // The block only renders for entries added in the last 7 days, so the dates
+  // are relative to the run, not fixed literals.
+  const today = new Date().toISOString().slice(0, 10)
+  const RECENT_REGISTRY = {
+    updated: '', count: 3,
+    categories: REGISTRY.categories,
+    plugins: [
+      { name: 'dsh-loop', owner: 'alice', url: 'https://github.com/alice/dsh-loop', category: ['tools'], npm: 'dsh-loop', stars: 50, added: today, description: { en: 'Loop task runner', zh: '循环执行' }, install: '' },
+      { name: 'dsh-notify', owner: 'bob', url: 'https://github.com/bob/dsh-notify', category: 'tools', npm: null, stars: 120, added: today, description: { en: 'Desktop notifications', zh: '桌面通知' }, install: '' },
+      { name: 'whale-skin', owner: 'carol', url: 'https://github.com/carol/whale-skin', category: 'theme', npm: null, stars: 80, added: '2020-01-01', description: { en: 'Whale theme', zh: '鲸鱼主题' }, install: '' },
+    ],
+  }
+  function mount() {
+    stubFetch({ '/dsh-market/registry': { source: 'live', registry: RECENT_REGISTRY, hostVersion: '0.1.2-alpha.2' } })
+    return render(<MarketSection {...props()} />)
+  }
+  const gridOf = (container: HTMLElement) => container.querySelector('#dshm-recent-grid')
+
+  it('collapses in place and keeps the grid mounted', async () => {
+    const { container } = mount()
+    const toggle = await screen.findByRole('button', { name: new RegExp(en.recentlyAdded) })
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(gridOf(container)).toBeTruthy()
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    // The point of the change: clipped, not unmounted. Unmounting takes the
+    // measured element away from the column-counting ResizeObserver.
+    expect(gridOf(container)).toBeTruthy()
+    expect(gridOf(container)!.className).toContain(css.recentCollapsed)
+    expect(localStorage.getItem('dshm-recent-collapsed')).toBe('1')
+  })
+
+  it('hides the whole block and restores it from the one-line button', async () => {
+    const { container } = mount()
+    fireEvent.click(await screen.findByRole('button', { name: en.recentHide }))
+    expect(gridOf(container)).toBeNull()
+    expect(localStorage.getItem('dshm-recent-hidden')).toBe('1')
+    fireEvent.click(screen.getByRole('button', { name: en.recentShow }))
+    expect(gridOf(container)).toBeTruthy()
+    expect(localStorage.getItem('dshm-recent-hidden')).toBe('0')
+  })
+
+  it('remembers both choices across a remount', async () => {
+    localStorage.setItem('dshm-recent-collapsed', '1')
+    localStorage.setItem('dshm-recent-hidden', '1')
+    const { container } = mount()
+    const restore = await screen.findByRole('button', { name: en.recentShow })
+    expect(gridOf(container)).toBeNull()
+    fireEvent.click(restore)
+    expect(gridOf(container)!.className).toContain(css.recentCollapsed)
+  })
+
+  it('re-attaches the column observer after the block is hidden and shown again', async () => {
+    // An inert observer that hands the test its callback, so width changes are
+    // delivered on demand — jsdom has no layout.
+    const observers: Array<{ emit: (width: number) => void }> = []
+    class StubObserver {
+      constructor(callback: (entries: Array<{ contentRect: { width: number } }>) => void) {
+        observers.push({ emit: (width: number) => callback([{ contentRect: { width } }]) })
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('ResizeObserver', StubObserver)
+    const emitWidth = async (width: number, list: typeof observers) => {
+      await act(async () => { list.forEach(observer => observer.emit(width)) })
+    }
+    const { container } = mount()
+    await screen.findByRole('button', { name: new RegExp(en.recentlyAdded) })
+    const before = observers.length
+    expect(before).toBeGreaterThan(0)
+    await emitWidth(600, observers)
+    expect(gridOf(container)!.getAttribute('style')).toContain('repeat(2')
+    fireEvent.click(screen.getByRole('button', { name: en.recentHide }))
+    fireEvent.click(screen.getByRole('button', { name: en.recentShow }))
+    // Restoring unmounts and remounts the measured element, so the effect has
+    // to run again. Without recentHidden in its deps no new observer appears
+    // and the block stops following a resize from here on.
+    const fresh = observers.slice(before)
+    expect(fresh.length).toBeGreaterThan(0)
+    await emitWidth(300, fresh)
+    expect(gridOf(container)!.getAttribute('style')).toContain('repeat(1')
+  })
+})
+
+describe('when DSH has unloaded the market (#962)', () => {
+  it('says the market stopped and that a restart brings it back, instead of loading forever', async () => {
+    // The host reloaded its plugins and did not mount the market again: every
+    // market route answers 404 while the page's own client keeps running.
+    stubFetch({
+      '/dsh-market/registry': { __status: 404 },
+      '/dsh-market/status': { __status: 404 },
+    })
+    render(<MarketSection {...props()} />)
+
+    expect(await screen.findByText(en.marketGoneTitle)).toBeTruthy()
+    expect(screen.getByText(en.marketGoneBody)).toBeTruthy()
+    // Neither the spinner nor the retry: nothing on this page can fix it, and
+    // a Retry button that 404s every time is a loop with no way out.
+    expect(screen.queryByText(en.loading)).toBeNull()
+    expect(screen.queryByRole('button', { name: en.loadRetry })).toBeNull()
+  })
+
+  it('settles an install whose answer was lost with the routes, and leaves nothing pending', async () => {
+    vi.useFakeTimers()
+    try {
+      let installStarted = false
+      vi.stubGlobal('fetch', vi.fn((url: string) => {
+        const path = String(url).split('?')[0]
+        if (path === '/dsh-market/install') {
+          installStarted = true
+          // The host unloaded the market mid-install: the response never comes.
+          return new Promise<Response>(() => {})
+        }
+        if (path === '/dsh-market/status' && installStarted) {
+          return Promise.resolve(new Response('', { status: 404 }))
+        }
+        const payload =
+          path === '/dsh-market/registry' ? { source: 'live', registry: REGISTRY, hostVersion: '0.1.2-alpha.2' }
+          : path === '/dsh-market/installed' ? { profile: 'web', installed: {}, live: [], disabled: [], groups: {}, groupOrder: [], favorites: [], blocked: [] }
+          : path === '/dsh-market/status' ? { active: false, pnpm: true, boot: 'boot-1', restart: true, installed: {} }
+          : path === '/dsh-market/updates' ? { updates: {} }
+          : path === '/dsh-market/discovery-compatibility' ? { hostVersion: '0.1.2-alpha.2', plugins: {} }
+          : null
+        if (payload === null) return Promise.reject(new Error(`unstubbed fetch: ${String(url)}`))
+        return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))
+      }))
+
+      render(<MarketSection {...props()} />)
+      await vi.waitFor(() => { screen.getByText('dsh-loop') })
+      fireEvent.click(screen.getAllByRole('button', { name: en.install })[0]!)
+      await vi.waitFor(() => { screen.getByRole('button', { name: en.confirmInstall }) })
+      fireEvent.click(screen.getByRole('button', { name: en.confirmInstall }))
+      await vi.waitFor(() => { expect(installStarted, 'the install never started').toBe(true) })
+      await vi.advanceTimersByTimeAsync(2100)
+
+      await vi.waitFor(() => { screen.getAllByText(en.marketGoneTitle) })
+      // The "install in progress" marker must not survive: a remount would
+      // otherwise restore the row and spin on a host that is not there.
+      expect(sessionStorage.getItem('dshm-pending')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

@@ -215,7 +215,7 @@ export interface UpdateStatus {
   /** A newer release exists but the profile's fresh-release wait has not
       passed yet (#945). `updateAvailable` is false and this names the wait;
       on the official Desktop there is no bypass to offer. */
-  heldUpdate?: { latest: string; until: string }
+  heldUpdate?: { latest: string; until: string; estimated?: true }
   /** Explicit source migration; never part of update-all. */
   sourceMigration?: { kind: 'git-to-npm'; repo: string; target: string }
 }
@@ -284,6 +284,11 @@ export interface MarketStatus {
    * behaviour, never a button taken away on a guess.
    */
   restartReachable?: boolean
+  /**
+   * Whether this profile offers a market restart route at all. Absent from an
+   * older host, which reads as "no button": the banner explains instead.
+   */
+  restart?: boolean
 }
 
 /**

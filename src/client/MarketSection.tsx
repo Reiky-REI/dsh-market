@@ -1837,6 +1837,27 @@ function readHostFilterPreference(): boolean {
   try { return localStorage.getItem(HOST_FILTER_KEY) !== 'all' } catch { return true }
 }
 
+/**
+ * 最近收录 display preferences: collapsed / hidden (#940).
+ *
+ * The block only appears on the discover tab with an empty search and both
+ * filters on "all", so it cannot be avoided without changing what the user is
+ * looking at — and it costs about a quarter of the first screen. Both states
+ * are display preferences, not profile settings: since 0.1.7 the settings
+ * surface is deliberately just `allowRestart`.
+ *
+ * Same read discipline as HOST_FILTER_KEY above: an unavailable store falls
+ * back to the default, and the default is "expanded and shown".
+ */
+const RECENT_COLLAPSED_KEY = 'dshm-recent-collapsed'
+const RECENT_HIDDEN_KEY = 'dshm-recent-hidden'
+function readRecentFlag(key: string): boolean {
+  try { return localStorage.getItem(key) === '1' } catch { return false }
+}
+function writeRecentFlag(key: string, next: boolean): void {
+  try { localStorage.setItem(key, next ? '1' : '0') } catch { /* storage unavailable — the choice just won't survive a reload */ }
+}
+
 /** "不再提示" on the settings-page sidebar tip. A missing store means show it. */
 const SIDEBAR_TIP_KEY = 'dshm-sidebar-tip-dismissed'
 function readSidebarTipDismissed(): boolean {
@@ -1896,6 +1917,16 @@ export function MarketSection(props: MarketSectionProps) {
   )
   const [data, setData] = useState<Registry | null>(cachedRegistry)
   const [loadError, setLoadError] = useState<string | null>(null)
+  /**
+   * The host answered 404 on one of the market's own routes (#962).
+   *
+   * That is not a failed request: it means DSH reloaded its plugins and did
+   * not mount the market again, so nothing on this page can reach the host —
+   * not the catalog, not the operation lock, not the restart route. The page
+   * already on screen keeps rendering (it is a client-side app), which is
+   * exactly why it owes the user this sentence instead of a spinner.
+   */
+  const [marketGone, setMarketGone] = useState(false)
   const [installed, setInstalledState] = useState<InstalledMap>(cachedInstalled ?? {})
   const setInstalled = useCallback((value: InstalledMap) => { cachedInstalled = value; setInstalledState(value) }, [])
   const [repoIdentities, setRepoIdentitiesState] = useState<InstalledRepoIdentities>(cachedRepoIdentities ?? {})
@@ -2666,6 +2697,43 @@ export function MarketSection(props: MarketSectionProps) {
     return () => window.removeEventListener('keydown', onKey, true)
   }, [lightbox, themesFullscreen])
 
+  /**
+   * The host is no longer serving the market's routes (#962).
+   *
+   * Only a 404 says this: any other status means the route ran and answered.
+   * When it happens mid-operation, the response that would have settled the
+   * install was lost with the routes, so the spinner has to be released and
+   * the row told what became of it — otherwise it turns until DSH restarts,
+   * with the user left to guess whether the plugin landed.
+   */
+  const noteMarketGone = useCallback(() => {
+    setMarketGone(true)
+    setBusyUrl(null)
+    setUpdatingName(null)
+    setRemovingName(null)
+    setRecords(list => list.map(record =>
+      record.state === 'running' || record.state === 'queued'
+        ? { ...record, state: 'failed' as const, reason: t('marketGoneRecord') }
+        : record))
+    try {
+      sessionStorage.removeItem('dshm-pending')
+      sessionStorage.removeItem('dshm-updating')
+    } catch { /* storage unavailable */ }
+  }, [t])
+
+  /**
+   * The status payload, or `null` when the route answered 404 (#962). Every
+   * poll that reads this stops on the null: the market is no longer mounted,
+   * so there is no status to read and nothing left to poll for.
+   */
+  const readMarketStatus = useCallback(async (res: Response): Promise<MarketStatus | null> => {
+    if (res.status === 404) {
+      noteMarketGone()
+      return null
+    }
+    return await res.json() as MarketStatus
+  }, [noteMarketGone])
+
   const loadCatalog = useCallback(() => {
     setLoadError(null)
     return fetch(api('/dsh-market/registry'), { cache: 'no-store' })
@@ -2674,6 +2742,10 @@ export function MarketSection(props: MarketSectionProps) {
           registry?: Registry
           hostVersion?: string | null
           error?: string
+        }
+        if (res.status === 404) {
+          noteMarketGone()
+          throw new Error(t('marketGoneTitle'))
         }
         if (!res.ok) throw new Error(typeof body.error === 'string' ? body.error : `HTTP ${String(res.status)}`)
         return body
@@ -2696,7 +2768,7 @@ export function MarketSection(props: MarketSectionProps) {
       // smaller today" looked identical on screen — and the second reading
       // is the one users reached.
       .catch((error: unknown) => { setLoadError(error instanceof Error ? error.message : String(error)) })
-  }, [])
+  }, [noteMarketGone, t])
 
   const loadHostCompatibility = useCallback(async (names: readonly string[]): Promise<void> => {
     const unique = [...new Set(names)].filter(name => {
@@ -2750,8 +2822,9 @@ export function MarketSection(props: MarketSectionProps) {
   useEffect(() => {
     void loadCatalog()
     fetch(api('/dsh-market/status'), { cache: 'no-store' })
-      .then(res => res.json())
+      .then(readMarketStatus)
       .then(status => {
+        if (status === null) return
         statusRef.current = {
           busy: status.busy === true,
           runningAgents: Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : [],
@@ -2782,7 +2855,7 @@ export function MarketSection(props: MarketSectionProps) {
       })
       .catch(() => {})
     refreshInstalled()
-  }, [refreshInstalled, loadCatalog])
+  }, [refreshInstalled, loadCatalog, readMarketStatus])
 
   // Pending-restart flags survive tab switches and page reloads, scoped to
   // one host process: a different boot id means the restart happened and the
@@ -2905,8 +2978,12 @@ export function MarketSection(props: MarketSectionProps) {
     }
     const timer = setInterval(() => {
       fetch(api('/dsh-market/status'), { cache: 'no-store' })
-        .then(res => res.json())
+        .then(readMarketStatus)
         .then(status => {
+          // 404: the host unloaded the market, and this poll is the only
+          // witness left of the operation it was tracking — noteMarketGone
+          // released the button and settled the row (#962).
+          if (status === null) return
           statusRef.current = {
             busy: status.busy === true,
             runningAgents: Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : [],
@@ -3099,6 +3176,21 @@ export function MarketSection(props: MarketSectionProps) {
   // cards underneath.
   const [recentColumns, setRecentColumns] = useState(1)
   const hasRecent = recentlyAdded.length > 0
+  const [recentCollapsed, setRecentCollapsed] = useState(() => readRecentFlag(RECENT_COLLAPSED_KEY))
+  const [recentHidden, setRecentHidden] = useState(() => readRecentFlag(RECENT_HIDDEN_KEY))
+  const toggleRecentCollapsed = useCallback(() => {
+    const next = !recentCollapsed
+    setRecentCollapsed(next)
+    writeRecentFlag(RECENT_COLLAPSED_KEY, next)
+  }, [recentCollapsed])
+  const hideRecent = useCallback(() => {
+    setRecentHidden(true)
+    writeRecentFlag(RECENT_HIDDEN_KEY, true)
+  }, [])
+  const showRecent = useCallback(() => {
+    setRecentHidden(false)
+    writeRecentFlag(RECENT_HIDDEN_KEY, false)
+  }, [])
   useLayoutEffect(() => {
     const row = recentRowRef.current
     if (row === null || typeof ResizeObserver === 'undefined') return
@@ -3107,7 +3199,14 @@ export function MarketSection(props: MarketSectionProps) {
     })
     observer.observe(row)
     return () => observer.disconnect()
-  }, [hasRecent, loadError])
+    // recentHidden belongs in the deps: hiding unmounts the row, so `ref` is
+    // null when this effect runs and it bails out. Restoring has to re-run it,
+    // or the observer is never attached and the block stops tracking width
+    // (it reopens at whatever column count it last saw, and never follows a
+    // resize again) — the trap #940's plan 1 walks into.
+    // recentCollapsed deliberately stays out: collapsing clips in place, the
+    // element keeps its width, and the existing observer stays correct.
+  }, [hasRecent, loadError, recentHidden])
   const recentPlugins = recentlyAdded.slice(0, recentColumns * 2)
   const { currentPage, totalPages, pageSize, goToPage, changePageSize } =
     usePagination(plugins.length, [q, cat, sortField, sortDir, timeRange, compatibleWithHost], scrollToTop)
@@ -4396,9 +4495,9 @@ export function MarketSection(props: MarketSectionProps) {
       // (#838). Ask first — with no record there is nothing to drain.
       if (!recordsRef.current.some(record => record.state === 'queued')) return
       void fetch(api('/dsh-market/status'), { cache: 'no-store' })
-        .then(res => res.json())
+        .then(readMarketStatus)
         .then(status => {
-          if (disposed) return
+          if (disposed || status === null) return
           const runningAgents: string[] = Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : []
           const busy = status.busy === true
           statusRef.current = { busy, runningAgents }
@@ -4427,7 +4526,7 @@ export function MarketSection(props: MarketSectionProps) {
       disposed = true
       clearInterval(timer)
     }
-  }, [])
+  }, [readMarketStatus])
 
   /** A queued record's "run now": retry immediately instead of waiting for idle. */
   const runQueuedNow = useCallback((record: OperationRecord, confirmAgentsRunning = false) => {
@@ -6099,7 +6198,7 @@ export function MarketSection(props: MarketSectionProps) {
             >
               <span className={css.bannerHint}><IconQuestionOutline14 size={14} /></span>
             </Tooltip>
-            {restartEnabled && restartReachable && debuggerLatch === null && recovery === null && (
+            {restartEnabled && restartReachable && debuggerLatch === null && recovery === null && !marketGone && (
               <Button
                 variant="primary"
                 size="sm"
@@ -6299,7 +6398,18 @@ export function MarketSection(props: MarketSectionProps) {
           setAssignFor(null)
         }}
       >
-        {tab === 'backup'
+        {/* Everything below reaches the host through the market's own routes;
+            with those gone (#962) every control here would fail on click, so
+            the body says the one thing that is both true and actionable
+            instead of leaving a page of dead buttons. */}
+        {marketGone
+          ? (
+              <div className={css.empty} role="alert">
+                <div><b>{t('marketGoneTitle')}</b></div>
+                <div className={css.spec}>{t('marketGoneBody')}</div>
+              </div>
+            )
+          : tab === 'backup'
           ? (
               <div className={css.backupGrid}>
                 <section className={css.backupCard}>
@@ -6524,13 +6634,37 @@ export function MarketSection(props: MarketSectionProps) {
                       )}
                     </div>
                     </div>
-                    {hasRecent && (
-                      <section aria-labelledby="dshm-recently-added">
-                        <h3 id="dshm-recently-added" className={css.favoritesSectionHead}>{t('recentlyAdded')}</h3>
-                        <div ref={recentRowRef} className={css.recentRow} style={{ gridTemplateColumns: `repeat(${recentColumns}, minmax(0, 1fr))` }}>
-                          {recentPlugins.map(plugin => pluginCard(plugin, `recent:${plugin.url}`))}
-                        </div>
-                      </section>
+                    {hasRecent && (recentHidden
+                      ? <button type="button" className={css.recentShow} onClick={showRecent}>
+                          <IconChevronDownOutline14 size={14} />{t('recentShow')}
+                        </button>
+                      : <section aria-labelledby="dshm-recently-added">
+                          <div className={css.recentHead}>
+                            <h3 id="dshm-recently-added" className={css.favoritesSectionHead}>
+                              <button
+                                type="button"
+                                className={css.recentToggle}
+                                aria-expanded={!recentCollapsed}
+                                aria-controls="dshm-recent-grid"
+                                onClick={toggleRecentCollapsed}
+                              >
+                                {recentCollapsed ? <IconChevronRightOutline14 size={14} /> : <IconChevronDownOutline14 size={14} />}
+                                {t('recentlyAdded')}
+                              </button>
+                            </h3>
+                            <Button variant="ghost" size="sm" className={css.recentHide} onClick={hideRecent}>{t('recentHide')}</Button>
+                          </div>
+                          {/* #940: clipped in place, never unmounted — the grid is what
+                              the column-counting ResizeObserver measures. */}
+                          <div
+                            id="dshm-recent-grid"
+                            ref={recentRowRef}
+                            className={recentCollapsed ? `${css.recentRow} ${css.recentCollapsed}` : css.recentRow}
+                            style={{ gridTemplateColumns: `repeat(${recentColumns}, minmax(0, 1fr))` }}
+                          >
+                            {recentPlugins.map(plugin => pluginCard(plugin, `recent:${plugin.url}`))}
+                          </div>
+                        </section>
                     )}
                     {plugins.length === 0
                       ? <EmptyResults blocked={pluginsAll.length > 0} t={t}
@@ -7364,11 +7498,21 @@ export function MarketSection(props: MarketSectionProps) {
                                           // passes (#945). The official Desktop has no
                                           // bypass, so the honest state is "waiting",
                                           // not a button that fails by construction.
-                                          ? (
-                                              <span className={css.metaTag} title={t('updateHeldHint').replace('{1}', String(Math.max(1, Math.ceil((Date.parse(status.heldUpdate.until) - Date.now()) / 3_600_000))))}>
-                                                {t('updateHeldTag').replace('{0}', displayLatest(status.heldUpdate.latest))}
-                                              </span>
-                                            )
+                                          ? (() => {
+                                              const left = Date.parse(status.heldUpdate.until) - Date.now()
+                                              // An estimated hold is the registry failing to say when
+                                              // the version shipped (#961), not a known window: say
+                                              // minutes and say why, rather than claiming a wait the
+                                              // market cannot know.
+                                              const estimated = status.heldUpdate.estimated === true
+                                              const amount = String(Math.max(1, Math.ceil(left / (estimated ? 60_000 : 3_600_000))))
+                                              const hint = t(estimated ? 'updateHeldEstimatedHint' : 'updateHeldHint').replace('{1}', amount)
+                                              return (
+                                                <span className={css.metaTag} title={hint}>
+                                                  {t('updateHeldTag').replace('{0}', displayLatest(status.heldUpdate.latest))}
+                                                </span>
+                                              )
+                                            })()
                                         : localDev
                                           ? null
                                           : status?.unreleasedCommit != null
