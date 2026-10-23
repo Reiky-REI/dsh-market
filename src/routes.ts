@@ -31,6 +31,7 @@ import {
   type PluginCommandRuntime,
 } from './dsh-cli.ts'
 import { packageOfEntryName } from './entry-identity.ts'
+import { PendingRowJournal, repairOrphanedRows } from './pending-rows.ts'
 import { addProfileBundle, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, declareProfileDependency, dropFromManifest, generationManagedNames, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledPackageName, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, restoreProfileManifest, setAllowBuilds, type ProfileManifestSnapshot } from './profile.ts'
 import { assessProfile, classifyPeer, introducedDuplicateNames, introducedRisks, type CompatibilityRisk } from './compatibility.ts'
 import { runningAgentIds, type AgentsLookup } from './agents.ts'
@@ -41,7 +42,7 @@ import { createProfileSnapshot, DEFAULT_MAX_SNAPSHOTS, deleteSnapshot, listSnaps
 import { readHostRecoveryView, restoreHostRecoveryBackup } from './host-recovery.ts'
 import { trialValidate } from './trial.ts'
 import { catalogRepoKey, findCatalogEntryForLocal, findInstalledAlias, gitCommitOfTarget, githubCommitOfTarget, githubTargetAtCommit, gitAllowBuildsKey, gitRefOfTarget, gitTargetAtCommit, gitUpdateTarget, hostedRepoKey, lookupRepoFromUrl, pinnedAllowBuildsKeys, installTargetFor, isGenerationLink, isLocalSpec, NPM_NAME_RE, repoOfTarget, restoreBlockedByWorkspace, restoreTargetForLocal, sourceFallbackFor, workspaceProtocolDeps } from './sources.ts'
-import { failureDetail, groupConflictsByOwner, isStaleUpdate, parseIgnoredBuildEntries, parseIgnoredBuilds, parsePrepareKey, parsePrepareNotAllowed, pnpmBlockedByOpenFiles, pnpmNeverStarted, pnpmRefusedYoungRelease, RELEASE_AGE_OVERRIDE, removeDanglingHostBridge, retargetCollections, validateAddedPlugins, withHoistRecovery } from './install.ts'
+import { failureDetail, groupConflictsByOwner, installApplied, isHostPortCollision, isStaleUpdate, parseIgnoredBuildEntries, parseIgnoredBuilds, parsePrepareKey, parsePrepareNotAllowed, pnpmBlockedByOpenFiles, pnpmNeverStarted, pnpmRefusedYoungRelease, RELEASE_AGE_OVERRIDE, removeDanglingHostBridge, retargetCollections, updateApplied, validateAddedPlugins, withHoistRecovery } from './install.ts'
 import { classifyPnpmFailure } from './pnpm-compat.ts'
 import { asChannel, CHANNELS, DIST_TAG, resolveChannel, type Channel } from './channels.ts'
 import {
@@ -492,6 +493,18 @@ export function mountMarketRoutes(
     throw new Error(message)
   }
   const activeProfileDir = profileDir(config.profile, config.profileDirectory)
+  // #987: a remove that died between deleting the package and clearing the
+  // rows its bundle patch declares leaves an insert naming a missing module —
+  // and DSH's boot is all-or-nothing, so that row can keep the host from
+  // starting at all. The intent was journaled before the destructive step;
+  // settle it now, against what the profile actually holds.
+  try {
+    const settled = repairOrphanedRows({ profile: config.profile, profileDirectory: activeProfileDir })
+    if (settled.removed.length > 0) logEvent('info', 'uninstall', `cleared patch rows left by an interrupted uninstall: ${settled.removed.join(', ')}`)
+    if (settled.failed.length > 0) logEvent('warn', 'uninstall', `patch rows from an interrupted uninstall could not be cleared, will retry: ${settled.failed.join(', ')}`)
+  } catch (error) {
+    logEvent('warn', 'uninstall', `could not settle interrupted uninstall rows — ${error instanceof Error ? error.message : String(error)}`)
+  }
   const analyzeActiveProfile = () => analyzeProfile(activeProfileDir, {
     ...(config.dshInstallDir === undefined ? {} : { dshInstallDir: config.dshInstallDir }),
   })
@@ -1635,8 +1648,15 @@ export function mountMarketRoutes(
     // deletes. Read afterwards this returns [] and the rows survive the
     // package as boot-time orphans (#799).
     const ownedRows = rowIdsForPackage(host, activeProfileDir, name)
+    // #987: written down before the destructive step, because the process can
+    // be unloaded between the remove and the cleanup below — and a row whose
+    // package is gone can stop the next boot.
+    const rowJournal = PendingRowJournal.forProfile(activeProfileDir)
+    rowJournal.begin({ profile: config.profile, name, patchPath: userPatchPath, rows: ownedRows })
     const result = await runPlugin(config.profile, ['remove', name])
     if (result.exitCode !== 0 || result.timedOut || result.cancelled) {
+      // Nothing was removed: the rows are still configuration, not orphans.
+      rowJournal.finish(config.profile, name)
       return { ok: false, hot: false, detail: failureDetail(result) }
     }
     // A host that owns the composition replays it instead of being
@@ -1664,6 +1684,7 @@ export function mountMarketRoutes(
     }
     const cleanedOwned = removeRowBlocks(userPatchPath, ownedRows)
     if (!cleanedOwned.ok) logEvent('warn', 'uninstall', `patch rows could not be cleared — ${cleanedOwned.reason}`)
+    else rowJournal.finish(config.profile, name)
     disabled.delete(name)
     replacedWhileLive.delete(name)
     removeFromGroups({ groups, groupOrder }, name)
@@ -4856,7 +4877,19 @@ sendJson(response, 200, { updates })
               // (#919). Same untouched profile; skipping the rollback keeps
               // the release-age reason visible instead of covering it with a
               // false "restoration could not be verified" alarm.
-              && !pnpmRefusedYoungRelease(result)) {
+              && !pnpmRefusedYoungRelease(result)
+              // The child booted the profile again and lost the host port
+              // AFTER pnpm wrote this update (#975). Rolling back would
+              // undo a build that is already on disk.
+              && !(isHostPortCollision(result) && updateApplied({
+                profile: config.profile,
+                name,
+                isGit,
+                beforeVersion,
+                beforeCommit,
+                spec,
+                explicitDir: activeProfileDir,
+              }))) {
               if (pnpmBlockedByOpenFiles(result)) {
                 const kept = keepLockedBuild()
                 rollbackOk = kept.ok
@@ -4910,6 +4943,18 @@ sendJson(response, 200, { updates })
               }
             }
             let ok = result.exitCode === 0 && !result.timedOut && !cancelled
+            if (!ok && !cancelled && isHostPortCollision(result) && updateApplied({
+              profile: config.profile,
+              name,
+              isGit,
+              beforeVersion,
+              beforeCommit,
+              spec,
+              explicitDir: activeProfileDir,
+            })) {
+              ok = true
+              logEvent('info', 'update', `${name}: command exited after the host port was already in use; the new build is on disk, treating as success (#975)`)
+            }
             let stale = false
             let versionFailureCode: 'DOWNGRADE_DETECTED' | 'RESOLVED_VERSION_MISMATCH' | null = null
             let versionFailureError: string | null = null
@@ -5107,8 +5152,12 @@ sendJson(response, 200, { updates })
                   ...brokenClientBundles(config.profile, activeProfileDir),
                 ].filter((entry, index, all) => all.findIndex(other => other.name === entry.name) === index),
               )
-              if (risks.length > 0 || shadowed.length > 0 || brokenBundles.length > 0) {
-                const rollbackId = rollbackPlan.available
+              const needsRollback = risks.length > 0 || brokenBundles.length > 0
+              // Shadowing alone stays informational (#913): still reported so the
+              // operator can look, but it proves nothing broke — so it must not
+              // arm a rollback button or claim the previous state was lost.
+              if (needsRollback || shadowed.length > 0) {
+                const rollbackId = needsRollback && rollbackPlan.available
                   ? savePendingRollback({
                       kind: 'update',
                       names: [name],
@@ -5121,13 +5170,15 @@ sendJson(response, 200, { updates })
                   risks,
                   shadowedNames: shadowed.length > 0 ? shadowed : undefined,
                   brokenBundles: brokenBundles.length > 0 ? brokenBundles : undefined,
-                  ...(rollbackId !== null
-                    ? { rollbackId }
-                    : {
+                  ...(needsRollback
+                    ? rollbackId !== null
+                      ? { rollbackId }
+                      : {
                         rollbackUnavailable: rollbackPlan.available
                           ? `更新完成后无法安全捕获 profile 状态（${previousVersionZh}），因此自动回滚不可用；需要时请从可信来源手工重新安装先前版本。 / The post-update profile state could not be captured safely (${previousVersionEn}), so automatic rollback is unavailable. Reinstall the prior version manually from a trusted source if needed.`
                           : rollbackPlan.detail,
-                      }),
+                        }
+                    : {}),
                 }
                 if (brokenBundles.length > 0) {
                   logEvent('error', 'update-bundle', `${brokenBundles.map(entry => `${entry.name}: ${entry.reason}`).join('; ')}`)
@@ -6011,9 +6062,16 @@ sendJson(response, 200, { updates })
             // interrupted mid-remove leaves the same "where did it go" with no
             // entry saying what was running.
             logEvent('info', 'uninstall-start', `${name} (profile ${config.profile})`)
+            // #987: the rows are journaled BEFORE the remove for the same
+            // reason they are read before it — and because this process can be
+            // unloaded in between (the official Desktop replays its plugin set
+            // after a profile change), which used to leave an insert naming a
+            // package that is no longer installed.
+            const rowJournal = PendingRowJournal.forProfile(activeProfileDir)
+            rowJournal.begin({ profile: config.profile, name, patchPath: userPatchPath, rows: ownedRows })
             const result = await runPlugin(config.profile, ['remove', name])
             const cancelled = result.cancelled
-            const ok = result.exitCode === 0 && !result.timedOut && !cancelled
+            let ok = result.exitCode === 0 && !result.timedOut && !cancelled
             const cancelDiff = cancelled ? changedSince(beforeInstalled) : null
             // Half-uninstall guard: pnpm can fail a remove AFTER deleting
             // node_modules but BEFORE saving package.json (#65's write-order
@@ -6029,7 +6087,14 @@ sendJson(response, 200, { updates })
             if (halfGone) {
               reconciled = dropFromManifest(config.profile, name, activeProfileDir)
               logEvent('warn', 'uninstall', `${name}: remove failed (exit ${String(result.exitCode)}) but the package is gone from disk; ${reconciled ? 'reconciled manifest lists to match' : 'manifest lists already clean'}`)
+              // Same disk truth, but the failure is the host port collision
+              // after a successful remove (#975): report success so the
+              // client does not treat a finished uninstall as a failure.
+              if (isHostPortCollision(result)) ok = true
             }
+            // The remove did not land and nothing half-gone was found: the
+            // package (and its rows) are exactly as they were.
+            if (!ok && !halfGone && !cancelled) rowJournal.finish(config.profile, name)
             let hot = false
             if (ok || halfGone) {
               invalidateUpdates()
@@ -6076,6 +6141,10 @@ sendJson(response, 200, { updates })
               // mounts is a boot-time orphan (port of dsh-plugin-hub).
               const cleanedOwned = removeRowBlocks(userPatchPath, ownedRows)
               if (!cleanedOwned.ok) logEvent('warn', 'uninstall', `patch rows could not be cleared — ${cleanedOwned.reason}`)
+              // Either way the record is settled: cleaned means nothing is
+              // left to do, and an unclean file is reported above rather than
+              // turned into a silent retry loop on every start.
+              else rowJournal.finish(config.profile, name)
               // The disable list must not keep a removed plugin: a later
               // reinstall starts enabled. Group memberships follow the same
               // rule so no group toggle ever targets a ghost member.
@@ -6465,7 +6534,10 @@ sendJson(response, 200, { updates })
               }
             }
             const cancelled = result.cancelled
-            if ((result.exitCode !== 0 || result.timedOut) && !cancelled) {
+            const portCollisionLanded = !cancelled
+              && isHostPortCollision(result)
+              && installApplied(config.profile, before, activeProfileDir)
+            if ((result.exitCode !== 0 || result.timedOut) && !cancelled && !portCollisionLanded) {
               const rolledBack = restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
               if (rolledBack.length > 0) logEvent('warn', 'install', `${target}: rolled back manifest residue of the failed run: ${rolledBack.join(', ')}`)
               if (lockfileBefore.ok) {
@@ -6473,7 +6545,10 @@ sendJson(response, 200, { updates })
                 if (!lock.ok) logEvent('warn', 'install', `${target}: could not restore pnpm-lock.yaml after the failed run: ${lock.detail ?? 'unknown'}`)
               }
             }
-            let ok = result.exitCode === 0 && !result.timedOut && !cancelled
+            let ok = (result.exitCode === 0 && !result.timedOut && !cancelled) || portCollisionLanded
+            if (portCollisionLanded && result.exitCode !== 0) {
+              logEvent('info', 'install', `${target}: command exited after the host port was already in use; the new plugin is on disk, treating as success (#975)`)
+            }
             const cancelDiff = cancelled ? changedSince(beforeSpecs) : null
             if (ok) invalidateUpdates()
             if (ok) {
@@ -6492,7 +6567,7 @@ sendJson(response, 200, { updates })
             let addedNothing = false
             let removedBroken: string[] = []
             let conflicts: { name: string; id: string; owner: string }[] = []
-            if (result.exitCode === 0 && !result.timedOut && !cancelled) {
+            if ((result.exitCode === 0 || portCollisionLanded) && !cancelled) {
               const validated = await validateAddedPlugins(runPlugin, config.profile, before, activeProfileDir)
               removedBroken = validated.removedBroken
               conflicts = validated.conflicts
@@ -6634,16 +6709,19 @@ sendJson(response, 200, { updates })
                   ...brokenClientBundles(config.profile, activeProfileDir),
                 ].filter((entry, index, all) => all.findIndex(other => other.name === entry.name) === index),
               )
-              if (risks.length > 0 || shadowed.length > 0 || brokenBundles.length > 0) {
-                const rollbackId = savePendingRollback({ kind: 'install', names: addedPackages })
+              const needsRollback = risks.length > 0 || brokenBundles.length > 0
+              if (needsRollback || shadowed.length > 0) {
+                const rollbackId = needsRollback ? savePendingRollback({ kind: 'install', names: addedPackages }) : null
                 compatibility = {
                   code: 'soft-incompatible',
                   risks,
                   shadowedNames: shadowed.length > 0 ? shadowed : undefined,
                   brokenBundles: brokenBundles.length > 0 ? brokenBundles : undefined,
-                  ...(rollbackId !== null
-                    ? { rollbackId }
-                    : { rollbackUnavailable: '安装完成后无法安全捕获 profile 状态，因此自动回滚不可用；需要时请手工卸载新安装的插件。 / The post-install profile state could not be captured safely, so automatic rollback is unavailable. Remove the newly installed plugin manually if needed.' }),
+                  ...(needsRollback
+                    ? rollbackId !== null
+                      ? { rollbackId }
+                      : { rollbackUnavailable: '安装完成后无法安全捕获 profile 状态，因此自动回滚不可用；需要时请手工卸载新安装的插件。 / The post-install profile state could not be captured safely, so automatic rollback is unavailable. Remove the newly installed plugin manually if needed.' }
+                    : {}),
                 }
                 if (brokenBundles.length > 0) {
                   logEvent('error', 'install-bundle', `${brokenBundles.map(entry => `${entry.name}: ${entry.reason}`).join('; ')}`)

@@ -48,6 +48,27 @@ describe('apply() icon gaps (#671)', () => {
   })
 })
 
+/** Like `hostWith`, but keeps each registration's options for inspection. */
+function hostWithEntries(declared: readonly string[]) {
+  const registrations: Record<string, unknown>[] = []
+  const slots = new Set(declared)
+  apply({
+    effect: (run: () => unknown) => { run() },
+    on: () => () => {},
+    locale: {
+      register: () => () => {}, bind: () => (key: string) => key,
+      subscribe: () => () => {}, getSnapshot: () => ({ active: 'en' }),
+    },
+    theme: { getTheme: () => null, setTheme: () => {} },
+    slots: {
+      inject: (slot: string, register: () => unknown) => { if (slots.has(slot)) register() },
+      register: (options: Record<string, unknown>) => { registrations.push(options); return () => {} },
+    },
+    inject: () => {},
+  } as Parameters<typeof apply>[0])
+  return { registrations }
+}
+
 /** A host that declares only the slots it has, and records what the market did. */
 function hostWith(declared: readonly string[]) {
   const registrations: Record<string, unknown>[] = []
@@ -76,7 +97,7 @@ function hostWith(declared: readonly string[]) {
 
 it('keeps the main market on hosts without settingsScope (#516)', () => {
   const { registrations, injections } = hostWith(['settings.section', 'shell.overlay'])
-  expect(injections).toEqual([['layout'], ['settingsScope']])
+  expect(injections).toEqual([['layout'], ['pluginNavigation'], ['settingsScope']])
   expect(registrations).toEqual(['settings.section', 'shell.overlay'])
 })
 
@@ -86,7 +107,7 @@ it('offers the market as a Plugins-page tab on the line that declares one (#722)
   // all and vanished silently. The tab slot is what its contract offers for a
   // page inside the Plugins section, and it is the one the market must follow.
   const { registrations, injections } = hostWith(['settings.section', 'shell.overlay', 'settings.plugins.tab'])
-  expect(injections).toEqual([['layout'], ['settingsScope']])
+  expect(injections).toEqual([['layout'], ['pluginNavigation'], ['settingsScope']])
   expect(registrations).toEqual(['settings.section', 'settings.plugins.tab', 'shell.overlay'])
 })
 
@@ -97,13 +118,33 @@ it('adds nothing to a sidebar that has panels until the user opts in (#846)', ()
   expect(registrations).toEqual(['settings.section', 'shell.overlay'])
 })
 
+it('adds the market as a tab on the Plugins page when the host declares one', () => {
+  // dsh 0.2.1-alpha.4 added `plugins.tab` to the Plugins page (已安装 | 发现):
+  // the host's own Discover tab is a registration into it. The market follows
+  // the slot, and everything it registered before stays as it was.
+  const host = hostWithEntries(['settings.section', 'shell.overlay', 'plugins.tab'])
+  expect(host.registrations.map(entry => entry.name)).toEqual(['settings.section', 'plugins.tab', 'shell.overlay'])
+  const tab = host.registrations.find(entry => entry.name === 'plugins.tab')!
+  // Placed before the host's Discover (which registers with no order, i.e. 0),
+  // so the market sits next to 已安装.
+  expect(tab.id).toBe('dsh-market')
+  expect(tab.order).toBeLessThan(0)
+})
+
+it('adds no Plugins-page tab on hosts that never declare it', () => {
+  // Every host before 0.2.1-alpha.4: the slot never arrives, so neither does
+  // the registration.
+  const host = hostWithEntries(['settings.section', 'shell.overlay'])
+  expect(host.registrations.map(entry => entry.name)).not.toContain('plugins.tab')
+})
+
 it('places the settings card on the bundle page a 0.1.7 host declares (#677)', () => {
   // The newer line has no plugin-configuration page and no settingsScope; it
   // declares `plugins.bundle.config`, which its own contract names as where a
   // third-party bundle's configuration belongs. The card must follow the
   // slot, and the market must still register everything else.
   const { registrations, injections } = hostWith(['settings.section', 'shell.overlay', 'plugins.bundle.config'])
-  expect(injections).toEqual([['layout'], ['settingsScope']])
+  expect(injections).toEqual([['layout'], ['pluginNavigation'], ['settingsScope']])
   expect(registrations).toEqual(['settings.section', 'plugins.bundle.config', 'shell.overlay'])
 })
 

@@ -46,15 +46,16 @@ import { downloadStatsText } from './download-stats.ts'
 import { OperationsPanel } from './OperationsPanel.tsx'
 import { applyRecovery, fetchRecovery, initialKeep, RecoveryPanel, watchRestart, type RecoveryView } from './RecoveryPanel.tsx'
 import { HostRecoveryBanner } from './HostRecoveryBanner.tsx'
-import { clearSettled, drop, enqueue, patch as patchRecord, recordForUrl } from './operations.ts'
+import { clearSettled, drop, enqueue, patch as patchRecord, recordForUrl, restoreSettled, serializeSettled, SETTLED_STORAGE_KEY } from './operations.ts'
 import type { OperationRecord } from './operations.ts'
 import { Diagnostics } from './Diagnostics.tsx'
 import { exportMarketLog } from './self-check.ts'
+import type { HostNavigationStore } from './host-navigation.ts'
 import type { SidebarEntry } from './sidebar-entry.ts'
 import {
   installCommandFor,
   api, applyGithubRouting, avatarColor, catalogEntryForInstalled, entryForDep, failureText, githubRouteCandidates, groupSwitchState, installedForCatalog, isGenerationSpec, isInstalled, localizeBilingual, localizeBilingualList, looksTerminal, matchInstalledName, orderedCategories, pluginCategories,
-  formatCount, pageItems, pluginName, blockAliases, pluginScreenshotCandidates, pluginScreenshots, pluginsForFavorites, queuedRowApplies, rankThemeScreenshots, readSession, releaseNotesHttpsImage, rememberGithubRoute, resetScreenshotsCache, resolveCatalogRestore, safeScreenshots, sanitizeReleaseNotesBody, staleFavoriteUrls, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins, restartHintKey,
+  formatCount, pageItems, pluginName, blockAliases, pluginScreenshotCandidates, pluginScreenshots, pluginsForFavorites, queuedRowApplies, rankThemeScreenshots, readSession, safeIcon, releaseNotesHttpsImage, rememberGithubRoute, resetScreenshotsCache, resolveCatalogRestore, safeScreenshots, sanitizeReleaseNotesBody, staleFavoriteUrls, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins, restartHintKey,
 } from './market-data.ts'
 import type {
 ActivationInfo, ActivationState, GistExportResult, InstalledMap, InstalledRepoHints, InstalledRepoIdentities, MarketStatus, Registry, RegistryPlugin,
@@ -491,9 +492,24 @@ function renderMarkdown(md: string): Array<JSX.Element | string> {
   return out
 }
 
-export function OwnerAvatar({ name, owner }: { name: string; owner: string }) {
+export function OwnerAvatar({ name, owner, icon }: { name: string; owner: string; icon?: string | null }) {
   const [failed, setFailed] = useState(false)
   const [routeIndex, setRouteIndex] = useState(0)
+  const [iconFailed, setIconFailed] = useState(false)
+  const tile = iconFailed ? null : safeIcon(icon)
+  if (tile !== null) {
+    return (
+      <img
+        className={css.av}
+        src={tile}
+        alt=""
+        loading="lazy"
+        decoding="async"
+        referrerPolicy="no-referrer"
+        onError={() => setIconFailed(true)}
+      />
+    )
+  }
   if (failed || owner === '') {
     return (
       <div className={css.av} style={{ background: avatarColor(name) }}>
@@ -1797,10 +1813,16 @@ export interface MarketSectionProps {
   /** The opt-in sidebar row. Absent, the page offers no shortcut tip. */
   sidebar?: SidebarEntry
   /**
-   * Which mount this is. The settings page may offer the sidebar shortcut;
-   * the sidebar page must not ask to open itself.
+   * The host's `pluginNavigation` (dsh 0.2.1+). Absent, installed plugins
+   * offer no link to the host's own page for them.
    */
-  surface?: 'settings' | 'sidebar'
+  hostNavigation?: HostNavigationStore
+  /**
+   * Which mount this is. Only the settings page may offer the sidebar
+   * shortcut; the sidebar page must not ask to open itself, and the Plugins
+   * page's tab is already one click from 已安装.
+   */
+  surface?: 'settings' | 'sidebar' | 'plugins'
 }
 
 interface SourceMigrationConfirm {
@@ -1875,7 +1897,16 @@ export function MarketSection(props: MarketSectionProps) {
     () => props.locale.getSnapshot(),
   )
   const lang = String(localeSnap.active).toLowerCase().startsWith('zh') ? 'zh' : 'en'
+  const surface = props.surface ?? 'settings'
   const sidebar = props.sidebar
+  // The host's own page for a bundle (dsh 0.2.1+). Subscribed rather than read
+  // once: the service arrives with the host's plugin manager, which may load
+  // after this panel is already on screen.
+  const hostNavigation = props.hostNavigation
+  const openInHost = useSyncExternalStore(
+    cb => hostNavigation?.subscribe(cb) ?? (() => {}),
+    () => hostNavigation?.get(),
+  )
   const [sidebarSnap, setSidebarSnap] = useState(() => ({
     supported: sidebar?.supported() === true,
     enabled: sidebar?.enabled() === true,
@@ -1897,7 +1928,7 @@ export function MarketSection(props: MarketSectionProps) {
     return sidebar.subscribe(sync)
   }, [sidebar])
   // Wait for load(): until then enabled is the default off, not a known choice.
-  const showSidebarTip = (props.surface ?? 'settings') === 'settings'
+  const showSidebarTip = surface === 'settings'
     && sidebarSnap.ready
     && sidebarSnap.supported
     && !sidebarSnap.enabled
@@ -1987,7 +2018,8 @@ export function MarketSection(props: MarketSectionProps) {
   /**
    * Every mutating operation the user started. Records outlive the card that
    * started them, so paginating or searching cannot take a pending decision
-   * off screen.
+   * off screen — and finished records outlive the page load too (see the
+   * settled restore below); one still moving or waiting on a decision does not.
    */
   const [records, setRecords] = useState<OperationRecord[]>([])
   const recordSeq = useRef(0)
@@ -2124,6 +2156,59 @@ export function MarketSection(props: MarketSectionProps) {
       else localStorage.setItem('dshm-queue-v1', JSON.stringify(queued))
     } catch { /* storage unavailable */ }
   }, [records])
+  /**
+   * Finished rows survive a page load — and only finished rows.
+   *
+   * A failed operation is the one thing the panel cannot recover by itself:
+   * after a reload the card is back to "Install", the plugin is not in
+   * Installed (the host rolled the change back), and the sentence naming what
+   * went wrong — plus the build-script approval that is the way out of it
+   * (#314) — lived only in React state.
+   *
+   * The queue key owns `queued`, the dshm-pending markers own `running`, and
+   * this key owns the rows that already ended. Unlike a queued row, a finished
+   * one has nothing left to judge, so the restore waits for nothing — not even
+   * the catalog.
+   */
+  const settledRestoredRef = useRef(false)
+  /** The restore's merge has not reached a render yet; see the write below. */
+  const settledMergePendingRef = useRef(false)
+  useEffect(() => {
+    if (settledRestoredRef.current) return
+    settledRestoredRef.current = true
+    let saved: string | null = null
+    try { saved = localStorage.getItem(SETTLED_STORAGE_KEY) } catch { saved = null }
+    const restored = restoreSettled(saved)
+    if (restored.length === 0) return
+    // Ids came from a previous mount's counter. Continue past them, or the next
+    // operation reuses an id and drop/patch would address two rows at once.
+    for (const record of restored) {
+      const match = /^op-(\d+)$/.exec(record.id)
+      if (match !== null) recordSeq.current = Math.max(recordSeq.current, Number(match[1]))
+    }
+    settledMergePendingRef.current = true
+    setRecords(prev => {
+      const known = new Set(prev.map(record => record.id))
+      const missing = restored.filter(record => !known.has(record.id))
+      return missing.length === 0 ? prev : [...prev, ...missing]
+    })
+  }, [])
+  useEffect(() => {
+    // Never write before the restore has read, and never write the pre-restore
+    // list: on the first render `records` is empty, so a write here would
+    // replace the stored rows with nothing just as the restore put them back.
+    // (The queue's restore has the same hazard, for the same reason.)
+    if (!settledRestoredRef.current) return
+    if (settledMergePendingRef.current) {
+      settledMergePendingRef.current = false
+      return
+    }
+    try {
+      const settled = serializeSettled(records)
+      if (settled.length === 0) localStorage.removeItem(SETTLED_STORAGE_KEY)
+      else localStorage.setItem(SETTLED_STORAGE_KEY, JSON.stringify(settled))
+    } catch { /* storage unavailable — the rows just won't survive a reload */ }
+  }, [records])
   /** Raised by the card marker, so "查看详情" lands on the record itself. */
   const [operationsOpen, setOperationsOpen] = useState(false)
   const openOperations = useCallback(() => setOperationsOpen(true), [])
@@ -2140,7 +2225,7 @@ export function MarketSection(props: MarketSectionProps) {
     return {
       title: pluginName(entry.name, entry.npm),
       author: entry.owner === '' ? undefined : entry.owner,
-      avatar: <OwnerAvatar name={entry.name} owner={entry.owner || ''} />,
+      avatar: <OwnerAvatar name={entry.name} owner={entry.owner || ''} icon={entry.icon ?? undefined} />,
     }
   }, [data])
   /** Ids are sequential rather than random so a replayed session is stable. */
@@ -2513,6 +2598,52 @@ export function MarketSection(props: MarketSectionProps) {
   const [installedBundles, setInstalledBundlesState] = useState<string[]>(() => cachedInstalledBundles)
   const setInstalledBundles = useCallback(cacheState(value => { cachedInstalledBundles = value }, setInstalledBundlesState), [])
   const bodyRef = useRef<HTMLDivElement | null>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  /**
+   * The Plugins page's tab has no height of its own.
+   *
+   * The host's page owns the scroll there and its tab panel is content-sized,
+   * so a `height: 100%` child resolves to auto: the market's own scroller
+   * would disappear and take the sticky category row, the back-to-top button
+   * and the collapse-on-scroll header with it. Measure the room left under
+   * the host's header and tabs and hand it back to the panel, so every other
+   * mount's layout rules keep working unchanged.
+   */
+  const [pluginsTabHeight, setPluginsTabHeight] = useState<number | null>(null)
+  useLayoutEffect(() => {
+    const root = rootRef.current
+    if (surface !== 'plugins' || root === null) {
+      setPluginsTabHeight(null)
+      return undefined
+    }
+    // Which ancestor scrolls is the host's business; find it rather than name it.
+    let page: HTMLElement | null = null
+    for (let node = root.parentElement; node !== null; node = node.parentElement) {
+      if (/^(auto|scroll)$/.test(getComputedStyle(node).overflowY)) { page = node; break }
+    }
+    if (page === null) return undefined
+    const host = page
+    const measure = (): void => {
+      // Hidden behind another tab the host keeps mounted: every rect is zero
+      // and the answer would be the whole page height. The observer fires
+      // again when this panel is shown.
+      if (root.getClientRects().length === 0) return
+      const bottom = Number.parseFloat(getComputedStyle(host).paddingBottom)
+      const room = host.clientHeight
+        - (root.getBoundingClientRect().top - host.getBoundingClientRect().top)
+        - (Number.isFinite(bottom) ? bottom : 0)
+      // A host that has not laid the page out yet answers with a negative
+      // room; the floor keeps the panel usable until the next measurement.
+      const next = Math.max(320, Math.round(room))
+      setPluginsTabHeight(prev => (prev === next ? prev : next))
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return undefined
+    const observer = new ResizeObserver(measure)
+    observer.observe(host)
+    observer.observe(root)
+    return () => { observer.disconnect() }
+  }, [surface])
   /** Hidden file input behind the Import button (a Button can't host an <input>). */
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [sortField, setSortField] = useState<SortField>('downloads')
@@ -3042,9 +3173,10 @@ export function MarketSection(props: MarketSectionProps) {
                 // lost (#100): the record `doInstall` created is still
                 // `running`, and releasing only the card's busy state leaves
                 // the Tasks entry claiming "Installing 1/1" for the rest of
-                // the mount — until settings travel remounts the section and
-                // drops `records` with it. The install landed, so the record
-                // has to land with it (#904).
+                // the mount. A remount used to hide it — `records` is React
+                // state, and a `running` row is still not one of the finished
+                // rows restored from storage — so the record has to land here.
+                // The install landed, so it does (#904).
                 setRecords(list => list.map(record =>
                   record.kind === 'install' && record.url === url && record.state === 'running'
                     ? { ...record, state: 'done' as const, needsRefresh: true }
@@ -3452,6 +3584,7 @@ export function MarketSection(props: MarketSectionProps) {
                 heldRelease: body.heldRelease,
               }
             : body.compatibility?.code === 'soft-incompatible'
+              && (body.compatibility.risks.length > 0 || (body.compatibility.brokenBundles?.length ?? 0) > 0)
               ? { state: 'warned', reason: t('compatRiskBanner') }
               : { state: 'done', needsRefresh: body.hot !== true }))
           refreshInstalled()
@@ -5215,6 +5348,11 @@ export function MarketSection(props: MarketSectionProps) {
   }
 
   const renderInstalledBlockMenu = (name: string) => {
+    // The host's page for this bundle, when it offers one. It is the only
+    // place a bundle's ROWS can be switched one by one, which is the reason
+    // to leave a page that already installs, updates and removes.
+    const hostPage = openInHost === undefined ? null : () => { openInHost.openBundle(name) }
+
     const entry = data === null ? undefined : catalogEntryForInstalled(data.plugins, name, String(installed[name] ?? ''), repoIdentities[name], repoHints[name])
     const aliases = entry === undefined ? [name] : blockAliases(entry, name)
     const hidden = aliases.some(alias => blockedNameSet.has(alias))
@@ -5250,6 +5388,7 @@ export function MarketSection(props: MarketSectionProps) {
           if (id === 'block') toggleBlock(blockToggleName(aliases))
           if (id === 'update-exempt') toggleUpdateExempt(name)
           if (id === 'ignore-boot') ignoreUpdateNotices([name])
+          if (id === 'host-page') hostPage?.()
           if (id === 'uninstall' && !uninstallBusy) setRemoveConfirm(name)
         }}
         align="end"
@@ -5271,6 +5410,7 @@ export function MarketSection(props: MarketSectionProps) {
           ...(favoriteUrl === undefined ? [] : [{ id: 'favorite', label: favorited ? t('favoriteRemove') : t('favoriteAdd') }]),
           { id: 'block', label: hidden ? t('blockRemove') : t('blockAdd') },
           ...(showBootIgnore ? [{ id: 'ignore-boot', label: t('ignoreUpdateNotice') }] : []),
+          ...(hostPage === null ? [] : [{ id: 'host-page', label: t('openInHostPage') }]),
           ...(showExempt ? [{ id: 'update-exempt', label: exempt ? t('updateExemptRemove') : t('updateExemptAdd') }] : []),
           { type: 'separator' as const, id: 'uninstall-sep' },
           { id: 'uninstall', label: removing ? t('uninstalling') : t('uninstall'), danger: true, disabled: uninstallBusy },
@@ -5525,7 +5665,7 @@ export function MarketSection(props: MarketSectionProps) {
               {p.deprecated === true && <span className={css.depBadge}>{t('deprecatedBadge')}</span>}
             </a>
             <div className={css.byline}>
-              <OwnerAvatar name={p.name} owner={p.owner || ''} />
+              <OwnerAvatar name={p.name} owner={p.owner || ''} icon={p.icon ?? undefined} />
               <span className={css.owner} title={p.owner}>{p.owner}</span>
               <CatalogVersionMark version={p.version} tip={catalogVersionTip} />
               <DownloadCount plugin={p} t={t} />
@@ -5672,7 +5812,7 @@ export function MarketSection(props: MarketSectionProps) {
                 <GithubRepoMark className={css.repoMark} />
               </a>
               <div className={css.byline}>
-                <OwnerAvatar name={p.name} owner={p.owner || ''} />
+                <OwnerAvatar name={p.name} owner={p.owner || ''} icon={p.icon ?? undefined} />
                 <span className={css.owner} title={p.owner}>{p.owner}</span>
                 <CatalogVersionMark version={p.version} tip={catalogVersionTip} />
                 <DownloadCount plugin={p} t={t} />
@@ -5972,8 +6112,11 @@ export function MarketSection(props: MarketSectionProps) {
 
   return (
     <div
+      ref={rootRef}
       className={`${css.root} notranslate`}
+      style={surface === 'plugins' && pluginsTabHeight !== null ? { height: `${String(pluginsTabHeight)}px` } : undefined}
       data-dsh-market-root
+      data-dsh-market-plugins-tab={surface === 'plugins' ? 'true' : undefined}
       /* Browser page translation is the one reported cause of the blank
          market (#293 by @apdc111, and the same shape in #286 / #241, none of
          which ever reproduced in an untranslated browser). Chrome and Edge
@@ -6337,7 +6480,11 @@ export function MarketSection(props: MarketSectionProps) {
             )}
           </span>
           <Button variant="outline" size="sm" onClick={() => setTab('diagnostics')}>{t('goDiagnose')}</Button>
-          {compatibilityNotice.rollbackId === undefined
+          {compatibilityNotice.risks.length === 0 && (compatibilityNotice.brokenBundles?.length ?? 0) === 0
+            // Same-name rows alone are informational (#913): they prove nothing
+            // broke, so there is nothing to roll back and nothing to warn about.
+            ? null
+            : compatibilityNotice.rollbackId === undefined
             ? <span>{compatibilityNotice.rollbackUnavailable ? localizeBilingual(compatibilityNotice.rollbackUnavailable, lang) : t('rollbackUnavailable')}</span>
             : (
                 <Button variant="primary" size="sm" disabled={rollingBack} onClick={() => void doRollback(compatibilityNotice.rollbackId!)}>
@@ -7727,7 +7874,7 @@ export function MarketSection(props: MarketSectionProps) {
               first paragraph made the methodology louder than the blurb (#739). */}
           <div className={css.confirmBody}>
           <div className={css.byline}>
-            <OwnerAvatar name={confirming.name} owner={confirming.owner || ''} />
+            <OwnerAvatar name={confirming.name} owner={confirming.owner || ''} icon={confirming.icon ?? undefined} />
             <span className={css.owner} title={confirming.owner}>{confirming.owner}</span>
             <CatalogVersionMark version={confirming.version} tip={catalogVersionTip} />
             <DownloadCount plugin={confirming} t={t} />

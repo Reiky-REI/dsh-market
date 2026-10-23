@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MarketSection, OwnerAvatar, resetHostCompatibilityCache, resetMarketPortalHost, resetThemePreviewCache } from '../../src/client/MarketSection.tsx'
 import css from '../../src/client/Market.module.css'
 import { downloadStatsText } from '../../src/client/download-stats.ts'
+import { createHostNavigation } from '../../src/client/host-navigation.ts'
 import { SEARCH_DELAY_MS } from '../../src/client/SearchInput.tsx'
 import {
   pluginScreenshotCandidates, resetGithubRouting, resetScreenshotsCache, restartHintKey, setGithubRoutes,
@@ -2644,6 +2645,105 @@ describe('MarketSection (jsdom)', () => {
     expect(JSON.parse(localStorage.getItem('dshm-queue-v1') ?? '[]')).toHaveLength(1)
   })
 
+  describe('finished operations across a reload', () => {
+    /** The Install button on one card, found by walking up from its name. */
+    const installButtonOf = (name: string) => {
+      let card: HTMLElement | null = screen.getByText(name)
+      while (card !== null && within(card).queryAllByRole('button', { name: en.install }).length === 0) {
+        card = card.parentElement
+      }
+      return within(card!).getAllByRole('button', { name: en.install })[0]!
+    }
+
+    /**
+     * A failed install is the row a reload used to eat: the card is back to
+     * "Install", the plugin is not in Installed (the host rolled it back), and
+     * the approval that was the only way forward disappeared with the row.
+     */
+    const failedInstall = {
+      id: 'op-4',
+      kind: 'install',
+      name: 'dsh-loop',
+      url: 'https://github.com/alice/dsh-loop',
+      state: 'failed',
+      reason: 'pnpm refused to run node-pty build scripts',
+      blockedBuilds: ['node-pty'],
+    }
+
+    it('restores a failed install row with its way out after a reload', async () => {
+      localStorage.setItem('dshm-settled-v1', JSON.stringify([failedInstall]))
+      stubFetch({
+        '/dsh-market/install': { ok: true, hot: false },
+        '/dsh-market/approve-builds': { ok: true, approved: ['node-pty'] },
+      })
+      render(<MarketSection {...props()} />)
+      await screen.findByText('dsh-loop')
+      // The card keeps the marker it had before the reload...
+      expect(await screen.findByRole('button', { name: en.opBlockedCard })).toBeTruthy()
+      // ...but the panel is not opened for the user; the row waits behind it.
+      expect(document.querySelector('[class*="opPanel"]')).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: en.opTitle }))
+      const panel = document.querySelector('[class*="opPanel"]')
+      expect(panel!.textContent).toContain('dsh-loop')
+      expect(panel!.textContent).toContain(failedInstall.reason)
+      // The way out travels with the record: one click approves and retries.
+      fireEvent.click(within(panel as HTMLElement).getByRole('button', { name: en.approveBuilds }))
+      await waitFor(() => {
+        expect(fetchCalls.some(call => call.path === '/dsh-market/approve-builds')).toBe(true)
+        expect(fetchCalls.some(call => call.path === '/dsh-market/install' && call.method === 'POST')).toBe(true)
+      })
+    })
+
+    it('ignores an unusable stored history without crashing or inventing a row', async () => {
+      localStorage.setItem('dshm-settled-v1', '{not json')
+      render(<MarketSection {...props()} />)
+      await screen.findByText('dsh-loop')
+      // The entry stays quiet, and opening it shows the ordinary empty state.
+      fireEvent.click(screen.getByRole('button', { name: en.opTitle }))
+      const panel = document.querySelector('[class*="opPanel"]')
+      expect(panel!.textContent).toContain(en.opEmpty)
+      // The bad value is dropped instead of being re-parsed on every mount.
+      expect(localStorage.getItem('dshm-settled-v1')).toBeNull()
+    })
+
+    it('restores a finished row without re-asking for a refresh already taken', async () => {
+      localStorage.setItem('dshm-settled-v1', JSON.stringify([{
+        id: 'op-2', kind: 'update', name: 'dsh-loop', state: 'done', needsRefresh: true,
+      }]))
+      render(<MarketSection {...props()} />)
+      await screen.findByText('dsh-loop')
+      fireEvent.click(screen.getByRole('button', { name: en.opTitle }))
+      const panel = document.querySelector('[class*="opPanel"]')
+      expect(panel!.textContent).toContain('dsh-loop')
+      expect(panel!.textContent).toContain(en.opDone)
+      // The reload already applied the change; offering Refresh would loop.
+      expect(within(panel as HTMLElement).queryByRole('button', { name: en.refresh })).toBeNull()
+    })
+
+    it('persists a row that finishes now, and clearing it empties the stored copy', async () => {
+      stubFetch({
+        '/dsh-market/install': {
+          ok: false, ignoredBuilds: ['node-pty'], error: 'blocked by pnpm', __status: 502,
+        },
+      })
+      render(<MarketSection {...props()} />)
+      await screen.findByText('dsh-loop')
+      fireEvent.click(installButtonOf('dsh-loop'))
+      fireEvent.click(await screen.findByRole('button', { name: en.confirmInstall }))
+      // The failure is written the moment the row becomes terminal...
+      await waitFor(() => {
+        const stored = JSON.parse(localStorage.getItem('dshm-settled-v1') ?? '[]') as Array<Record<string, unknown>>
+        expect(stored).toHaveLength(1)
+        expect(stored[0]).toMatchObject({ state: 'failed', name: 'dsh-loop', blockedBuilds: ['node-pty'] })
+      })
+      // ...and "clear finished" empties it through the same records state.
+      const panel = document.querySelector('[class*="opPanel"]')
+      expect(panel, 'the failed row did not open the panel').toBeTruthy()
+      fireEvent.click(within(panel as HTMLElement).getByRole('button', { name: en.opClear }))
+      await waitFor(() => expect(localStorage.getItem('dshm-settled-v1')).toBeNull())
+    })
+  })
+
   it('shows a compatibility-risk banner after an update and rolls back on demand (#195)', async () => {
     const fetchMock = stubFetch({
       '/dsh-market/installed': { profile: 'web', installed: { 'dsh-loop': '^1.0.0' }, live: [] },
@@ -2670,6 +2770,36 @@ describe('MarketSection (jsdom)', () => {
       expect(fetchMock.mock.calls.some(([url]) => url === '/dsh-market/rollback')).toBe(true)
     })
     expect(screen.queryByText(en.compatRiskBanner)).toBeNull()
+  })
+
+  it('reports a same-name row as informational, with no rollback (#913)', async () => {
+    // The #913 shape: the install mounts a second instance of an existing
+    // plugin name from a bundle patch. Both rows can load, so the banner must
+    // not promise that one wins, and nothing is armed for rollback.
+    const fetchMock = stubFetch({
+      '/dsh-market/installed': { profile: 'web', installed: { 'dsh-loop': '^1.0.0' }, live: [] },
+      '/dsh-market/updates': { updates: { 'dsh-loop': { kind: 'npm', version: '1.0.0', current: '1.0.0', latest: '1.2.0', updateAvailable: true } } },
+      '/dsh-market/update': {
+        ok: true,
+        activation: { 'dsh-loop': { state: 'restart', hot: false, bundle: true, reasons: ['restart to apply'] } },
+        compatibility: {
+          code: 'soft-incompatible',
+          risks: [],
+          shadowedNames: [{ name: '@deepseek-ai/dsh-skill-filesystem', layers: ['bundle:dsh-base', 'bundle:dsh-loop'], count: 2 }],
+        },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    fireEvent.click(await screen.findByRole('button', { name: en.update }))
+
+    expect(await screen.findByText(en.shadowNameBanner)).toBeTruthy()
+    // #913: the copy no longer claims only one of the two rows will load.
+    expect(en.shadowNameBanner).not.toContain('only one will load')
+    expect(screen.queryByRole('button', { name: en.rollbackNow })).toBeNull()
+    expect(screen.queryByText(en.rollbackUnavailable)).toBeNull()
+    expect(fetchMock.mock.calls.some(([url]) => url === '/dsh-market/rollback')).toBe(false)
   })
 
   it('does not offer a rollback action when the server could not capture an exact source', async () => {
@@ -3290,6 +3420,60 @@ describe('#60 enable/disable switches in the Installed tab', () => {
  * then uninstall and the page is level again, with nothing left for a
  * refresh to show, yet it kept asking. It was reporting session history,
  * not pending work. */
+describe("the host's own page for a plugin (dsh 0.2.1+)", () => {
+  /** One installed plugin, live, with the host offering its navigation service. */
+  function renderInstalled(navigation?: { openBundle: (name: string) => void }) {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web',
+        installed: { 'dsh-loop': '^1.0.0' },
+        live: ['dsh-loop'],
+        disabled: [],
+        groups: {},
+        groupOrder: [],
+      },
+    })
+    const store = createHostNavigation()
+    if (navigation !== undefined) store.attach(navigation)
+    const element = render(<MarketSection {...props()} hostNavigation={store} />)
+    return { ...element, store }
+  }
+
+  it('opens the bundle on the host when the service is there', async () => {
+    const opened: string[] = []
+    renderInstalled({ openBundle: name => opened.push(name) })
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    await openRowMenu('dsh-loop')
+    fireEvent.click(await screen.findByRole('menuitem', { name: en.openInHostPage }))
+    expect(opened).toEqual(['dsh-loop'])
+  })
+
+  it('offers nothing on a host that never provides the service', async () => {
+    // Every dsh before 0.2.1, and any host whose plugin manager is not
+    // mounted. An entry that cannot do anything is worse than no entry.
+    renderInstalled()
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    await openRowMenu('dsh-loop')
+    expect(screen.queryByRole('menuitem', { name: en.openInHostPage })).toBeNull()
+  })
+
+  it('offers it to a menu already on screen when the service arrives late', async () => {
+    // The manager's client half can load after this panel; a menu drawn from a
+    // setup-time snapshot would never show the action on a host that has it.
+    const opened: string[] = []
+    const { store } = renderInstalled()
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    await openRowMenu('dsh-loop')
+    expect(screen.queryByRole('menuitem', { name: en.openInHostPage })).toBeNull()
+    store.attach({ openBundle: name => opened.push(name) })
+    fireEvent.click(await screen.findByRole('menuitem', { name: en.openInHostPage }))
+    expect(opened).toEqual(['dsh-loop'])
+  })
+})
+
 describe('refresh banner falls back when the change is undone (#340)', () => {
   it('stops asking after the installed plugin is uninstalled again', async () => {
     let present: Record<string, string> = {}
@@ -6399,8 +6583,9 @@ describe('lost install response (#100)', () => {
     // The same lost-response path as above, one layer up: the poll is the only
     // witness that the install landed. It released the card's busy state, but
     // the record `doInstall` put in the Tasks panel was still `running`, so the
-    // entry kept saying "Installing 1/1" for the rest of the mount — and only
-    // switching settings tabs (a remount that drops `records`) cleared it.
+    // entry kept saying "Installing 1/1" for the rest of the mount. A remount
+    // used to mask it: `records` is React state, and only FINISHED rows are
+    // restored from storage, so a `running` row still vanished with the mount.
     vi.useFakeTimers()
     try {
       let installedNow: Record<string, string> = {}
@@ -8661,5 +8846,21 @@ describe('when DSH has unloaded the market (#962)', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('OwnerAvatar icon', () => {
+  it('prefers the catalog-declared icon over the owner avatar', () => {
+    const icon = 'https://raw.githubusercontent.com/alice/dsh-loop/main/assets/icon.png'
+    const { container } = render(<OwnerAvatar name="dsh-loop" owner="alice" icon={icon} />)
+    expect(container.querySelector('img')?.getAttribute('src')).toBe(icon)
+  })
+
+  it('refuses an icon outside the GitHub image hosts and falls back', () => {
+    const { container } = render(
+      <OwnerAvatar name="dsh-loop" owner="" icon="https://evil.example/icon.png" />,
+    )
+    expect(container.querySelector('img')).toBeNull()
+    expect(container.textContent).toBe('L')
   })
 })

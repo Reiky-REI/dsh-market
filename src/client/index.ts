@@ -18,6 +18,7 @@ import { createSectionGate } from './section-gate.ts'
 import { exportMarketLog } from './self-check.ts'
 import { SettingsCard } from './SettingsCard.tsx'
 import { installSettingsNavIcon } from './settings-nav-icon.ts'
+import { createHostNavigation } from './host-navigation.ts'
 import { createSidebarEntry, SIDEBAR_PANEL_ID, SIDEBAR_PANEL_ORDER } from './sidebar-entry.ts'
 import type { SidebarEntry } from './sidebar-entry.ts'
 import { MarketLogo } from './MarketSection.tsx'
@@ -173,12 +174,18 @@ function mountMarket(ctx: MarketClientContext): void {
   // would see no controller, and the page simply offers no tip.
   let sidebar: SidebarEntry | undefined
   /**
+   * The host's `pluginNavigation` (dsh 0.2.1+), published as a store so the
+   * panel's menus can offer "在插件页查看" whether the service is there before
+   * or after this package mounts. See host-navigation.ts.
+   */
+  const hostNavigation = createHostNavigation()
+  /**
    * The market's own panel, as an element — one builder for the settings
    * section this package registers and for `market.render()` (#602). Built
    * per call: the props are live (locale, theme, the host's preferred
    * subsection), and a cached element would freeze the first caller's.
    */
-  const buildMarketElement = (ownerProps: { preferredSubsectionId?: string; surface?: 'settings' | 'sidebar' } = {}): unknown => marketElement({
+  const buildMarketElement = (ownerProps: { preferredSubsectionId?: string; surface?: 'settings' | 'sidebar' | 'plugins' } = {}): unknown => marketElement({
     t,
     locale: ctx.locale,
     theme: ctx.theme,
@@ -195,6 +202,7 @@ function mountMarket(ctx: MarketClientContext): void {
     exportLog: () => { void exportMarketLog().catch(() => {}) },
     preferredSubsectionId: ownerProps.preferredSubsectionId,
     sidebar,
+    hostNavigation,
     surface: ownerProps.surface ?? 'settings',
   })
 
@@ -264,6 +272,18 @@ function mountMarket(ctx: MarketClientContext): void {
   setTimeout(() => { sidebar?.refresh() }, 0)
   ;(ctx as unknown as { inject(services: string[], callback: (scoped: { layout: LayoutService }) => void): void })
     .inject(['layout'], (scoped) => { layout = scoped.layout })
+
+  // The host's own page for a bundle (dsh 0.2.1+). Its Plugins page documents
+  // `pluginNavigation.openBundle(packageName)` for other client plugins: the
+  // bundle's page is where its rows are switched one by one, which no public
+  // contract lets a third party draw. Nested inject, like the settings card
+  // below: naming the service in the module-level `inject` would keep the
+  // whole plugin unmounted on every host without it, and this one is young.
+  ;(ctx as unknown as {
+    inject(services: string[], callback: (scoped: { pluginNavigation: { openBundle(name: string): void } }) => void): void
+  }).inject(['pluginNavigation'], (scoped) => {
+    hostNavigation.attach({ openBundle: (name) => { scoped.pluginNavigation.openBundle(name) } })
+  })
   const retire = (): void => {
     sectionGate.retire()
     sidebarGate.retire()
@@ -377,6 +397,39 @@ function mountMarket(ctx: MarketClientContext): void {
     locale: NS,
     inject: () => ({ t }),
   }, () => h(SettingsCard, { t, sidebar, onRemoved: retire })))
+
+  // The Plugins page's own tab row (dsh 0.2.1-alpha.4+). The page that
+  // shows 已安装 next to 发现 declares `plugins.tab` for exactly this: another
+  // plugin adds a tab after 已安装 and draws whatever it likes there. The
+  // official Discover tab is itself such a registration, which is why the
+  // market belongs here rather than only behind Settings — same page, one
+  // click from 已安装, and no dependency on where each host puts Settings.
+  //
+  // Order −1 places the market between 已安装 and the host's own 发现 tab:
+  // the same adjacency the sidebar row uses, and the market is the fuller
+  // catalog of the two.
+  //
+  // Detection is the slot, as everywhere else in this file: hosts before
+  // 0.2.1-alpha.4 never declare it (their tab row is `settings.plugins.tab`,
+  // which the market already occupies), so nothing is added there. The owner
+  // props this slot hands over (`install`, `openPackage`) drive the host's own
+  // install dialog and Installed list; the market brings both of its own, so
+  // they are deliberately not used — routing installs through the host would
+  // take the progress, the task list and the cancel with them.
+  const pluginsPageTabCtx = ctx as unknown as {
+    slots: {
+      inject(name: string, register: () => unknown): void
+      register(options: Record<string, unknown>, render: () => unknown): unknown
+    }
+  }
+  pluginsPageTabCtx.slots.inject('plugins.tab', () => pluginsPageTabCtx.slots.register({
+    name: 'plugins.tab',
+    id: NS,
+    order: -1,
+    label: () => t('nav'),
+    locale: NS,
+    inject: () => ({ t }),
+  }, () => buildMarketElement({ surface: 'plugins' })))
 
   const Toast = () => h(InstallToast, { t })
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
