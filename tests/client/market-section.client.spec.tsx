@@ -3245,6 +3245,35 @@ describe('#60 enable/disable switches in the Installed tab', () => {
     expect(screen.queryByRole('switch')).toBeNull()
   })
 
+  it('shows a declared library as shared code, keeps updates, and explains uninstall consequences (#995)', async () => {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web', installed: { 'dsh-shared': '^0.1.7' }, live: [], disabled: ['dsh-shared'],
+        groups: {}, groupOrder: [],
+        activation: {
+          'dsh-shared': { state: 'inert', library: true, reasons: ['供其他插件使用，无需启用 / for other plugins to use; no need to enable it'], bundle: false, hot: false },
+        },
+      },
+      '/dsh-market/updates': { updates: { 'dsh-shared': { kind: 'npm', version: '0.1.7', current: '0.1.7', latest: '0.1.8', updateAvailable: true } } },
+      '/dsh-market/update': { ok: true, activation: { 'dsh-shared': { state: 'inert', library: true, reasons: ['for other plugins to use'], bundle: false, hot: false } } },
+    })
+    render(<MarketSection {...props()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    await screen.findByText('dsh-shared')
+
+    expect(screen.getByText('Library')).toBeTruthy()
+    expect(screen.getByText('Shared code for other plugins. No need to enable it.')).toBeTruthy()
+    expect(screen.queryByText(en.stateInert)).toBeNull()
+    expect(screen.queryByText(en.switchOnLabel)).toBeNull()
+    expect(screen.queryByRole('switch')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: en.update }))
+    expect(await screen.findByText('✓ Updated')).toBeTruthy()
+    expect(screen.queryByText(en.updated)).toBeNull()
+
+    await openCardUninstall()
+    expect(screen.getByText('Removing this library may stop plugins that use it from starting.')).toBeTruthy()
+  })
+
   it('never lists the market itself in the Installed tab — it manages itself from its own settings card', async () => {
     stubFetch({
       '/dsh-market/installed': {
@@ -4137,6 +4166,46 @@ describe('#60 catalog deprecation', () => {
 })
 
 describe('#60 groups view', () => {
+  it('labels an ungrouped declared library as a library (#995)', async () => {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web', installed: { 'dsh-shared': '^0.1.7' }, live: [], disabled: [],
+        groups: {}, groupOrder: [],
+        activation: {
+          'dsh-shared': { state: 'inert', library: true, reasons: ['for other plugins to use'], bundle: false, hot: false },
+        },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    fireEvent.click(screen.getByRole('button', { name: en.tabGroups }))
+
+    const row = (await screen.findByText('dsh-shared')).closest('[class*="ungroupedRow"]') as HTMLElement
+    expect(within(row).getByText(en.stateLibrary)).toBeTruthy()
+    expect(within(row).queryByText(en.groupStateInert)).toBeNull()
+  })
+
+  it('does not offer library switches in a group (#995)', async () => {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web', installed: { 'dsh-loop': '^1.0.0', 'dsh-shared': '^0.1.7' },
+        live: ['dsh-loop'], disabled: [], groups: { work: ['dsh-loop', 'dsh-shared'] }, groupOrder: ['work'],
+        activation: {
+          'dsh-loop': { state: 'live', reasons: [], bundle: true, hot: true },
+          'dsh-shared': { state: 'inert', library: true, reasons: ['used by other plugins'], bundle: false, hot: false },
+        },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    fireEvent.click(screen.getByRole('button', { name: en.tabGroups }))
+
+    expect(await screen.findByText('dsh-shared')).toBeTruthy()
+    expect(screen.getByRole('switch', { name: en.disable + ' work' })).toBeTruthy()
+    expect(screen.getByRole('switch', { name: en.disable + ' dsh-loop' })).toBeTruthy()
+    expect(screen.queryByRole('switch', { name: en.disable + ' dsh-shared' })).toBeNull()
+  })
+
   /** Stateful fake: mirrors the server-side group/toggle semantics in memory. */
   function makeFake(installed: Record<string, string>, activationOverride?: Record<string, unknown>) {
     const state = { disabled: [] as string[], groups: {} as Record<string, string[]>, groupOrder: [] as string[] }
@@ -7459,11 +7528,11 @@ describe('category row expansion', () => {
       const { container } = render(<MarketSection {...props()} />)
       await screen.findByText('dsh-loop')
       const chipCount = () => container.querySelectorAll('[data-chip="1"]').length
-      // 4/row × 2 rows → 8 fit → budget 7 → show 6 categories + 「全部」.
-      await waitFor(() => expect(chipCount()).toBe(7))
+      // 4/row × 1 row → 4 fit → 3 categories + 「全部」.
+      await waitFor(() => expect(chipCount()).toBe(4))
       act(() => resizeCats(900))
-      // 8/row × 2 rows fits every chip; collapsed shows the full set.
-      await waitFor(() => expect(chipCount()).toBe(11))
+      // 8/row × 1 row → 7 categories + 「全部」.
+      await waitFor(() => expect(chipCount()).toBe(8))
     } finally {
       if (offsetTopDesc) Object.defineProperty(HTMLElement.prototype, 'offsetTop', offsetTopDesc)
       else Reflect.deleteProperty(HTMLElement.prototype, 'offsetTop')
@@ -7642,11 +7711,10 @@ describe('category row expansion', () => {
       // Sentinel scrolled out of view above the scroll root: the header is now stuck.
       onChange!({ isIntersecting: false })
       await waitFor(() => expect(chipCount()).toBeLessThan(openCount))
-      // Squeezed to the one-row budget (2 categories, reserving a slot for
-      // the chevron), not the two-row budget (6) the plain collapsed state
-      // would use — proves the stuck path swapped budgets, not just re-ran
-      // the ordinary collapse.
-      expect(chipCount()).toBe(3) // "all" pill + 2 categories
+      // Squeezed to the one-row budget — the same row the collapsed state
+      // uses, chevron included in its own cell beside the wrap rather than
+      // taking a chip slot.
+      expect(chipCount()).toBe(4) // "all" pill + 3 categories
       // Auto-collapse is render-derived (`catsExpanded = stuckExpanded` while
       // pinned, starting false) — not a follow-up catsOpen flip. Chevron still
       // tracks catsExpanded, and clicking it while stuck must keep working
